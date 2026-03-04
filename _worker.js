@@ -1,21 +1,13 @@
 const FIXED_UUID = '64c6e2fe-e7a8-4118-b3bc-a1ecd5b9553a'; 
 const SECRET_PATH = '/your-secret-path'; 
-
-// 你的反代/出口代理配置
 let 反代IP = 'yx1.9898981.xyz:8443';
 
 export default {
     async fetch(request) {
         try {
             const url = new URL(request.url);
-            if (url.pathname !== SECRET_PATH) {
-                return new Response('Not Found', { status: 404 });
-            }
-
-            if (request.headers.get('Upgrade') !== 'websocket') {
-                return new Response(JSON.stringify({ status: "UP", fallback: 反代IP }), { status: 200 });
-            }
-
+            if (url.pathname !== SECRET_PATH) return new Response('Not Found', { status: 404 });
+            if (request.headers.get('Upgrade') !== 'websocket') return new Response('UP', { status: 200 });
             return await handleSPESSWebSocket(request);
         } catch (err) {
             return new Response(err.message, { status: 500 });
@@ -28,11 +20,10 @@ async function handleSPESSWebSocket(request) {
     const [clientWS, serverWS] = Object.values(wsPair);
     serverWS.accept();
 
-    const earlyDataHeader = request.headers.get('sec-websocket-protocol') || '';
-    const wsReadable = createWebSocketReadableStream(serverWS, earlyDataHeader);
+    const wsReadable = createWebSocketReadableStream(serverWS, request.headers.get('sec-websocket-protocol') || '');
     let remoteSocket = null;
-    let udpStreamWrite = null;
     let isDns = false;
+    let udpStreamWrite = null;
 
     wsReadable.pipeTo(new WritableStream({
         async write(chunk) {
@@ -46,7 +37,6 @@ async function handleSPESSWebSocket(request) {
             
             const result = parseVLESSHeader(chunk);
             if (result.hasError) throw new Error(result.message);
-            
             const vlessRespHeader = new Uint8Array([result.vlessVersion[0], 0]);
             const rawClientData = chunk.slice(result.rawDataIndex);
             
@@ -58,18 +48,21 @@ async function handleSPESSWebSocket(request) {
                 return;
             }
 
-            // --- 核心重试逻辑（参考原始代码方案） ---
+            // --- 强化版 Fallback 逻辑 ---
             const [proxyHost, proxyPort] = 反代IP.split(':');
+            
+            // 1. 预判：如果是 CF 域名或 ip.sb，直接强制走代理
+            const isCFDomain = (host) => {
+                const blackList = ['ip.sb', 'cloudflare.com', 'workers.dev', 'pages.dev'];
+                return blackList.some(domain => host.endsWith(domain));
+            };
 
-            // 定义重试函数：如果直连不通，则尝试通过代理
-            async function tryConnect(useProxy = false) {
+            async function doConnect(forceProxy = false) {
                 try {
                     let socket;
-                    if (useProxy) {
-                        // 走 HTTP CONNECT 代理方案
+                    if (forceProxy || isCFDomain(result.addressRemote)) {
                         socket = await httpConnect(result.addressRemote, result.portRemote, proxyHost, proxyPort || 8443);
                     } else {
-                        // 尝试直连
                         socket = await connect({ hostname: result.addressRemote, port: result.portRemote });
                     }
                     
@@ -78,22 +71,20 @@ async function handleSPESSWebSocket(request) {
                     await writer.write(rawClientData);
                     writer.releaseLock();
 
-                    // 这里的 pipe 逻辑需要处理直连成功但没数据返回的情况（类似原始代码的 retry）
+                    // 启动转发，设置更激进的超时检测 (800ms)
                     pipeRemoteToWebSocket(socket, serverWS, vlessRespHeader, async () => {
-                        if (!useProxy) {
-                            console.log("直连无数据，尝试切换代理...");
-                            await tryConnect(true);
+                        if (!forceProxy && !remoteSocket.dataReceived) {
+                            console.log("直连超时无响应，快速切代理...");
+                            await doConnect(true);
                         }
                     });
                 } catch (err) {
-                    if (!useProxy) {
-                        return await tryConnect(true);
-                    }
-                    serverWS.close(1011, 'Connection All Failed');
+                    if (!forceProxy) return await doConnect(true);
+                    serverWS.close(1011, 'Connect Failed');
                 }
             }
 
-            await tryConnect(false); // 初始尝试直连
+            await doConnect(false);
         },
         close() { if (remoteSocket) remoteSocket.close(); }
     })).catch(() => {
@@ -104,50 +95,43 @@ async function handleSPESSWebSocket(request) {
     return new Response(null, { status: 101, webSocket: clientWS });
 }
 
-// 优化的代理连接函数
-async function httpConnect(host, port, proxyHost, proxyPort) {
-    const sock = await connect({ hostname: proxyHost, port: parseInt(proxyPort) });
+async function httpConnect(host, port, pHost, pPort) {
+    const sock = await connect({ hostname: pHost, port: parseInt(pPort) });
     const req = `CONNECT ${host}:${port} HTTP/1.1\r\nHost: ${host}:${port}\r\nProxy-Connection: Keep-Alive\r\n\r\n`;
-
     const writer = sock.writable.getWriter();
     await writer.write(new TextEncoder().encode(req));
     writer.releaseLock();
 
     const reader = sock.readable.getReader();
     const { value } = await reader.read();
-    const resp = new TextDecoder().decode(value);
     reader.releaseLock();
-
-    if (resp.includes(' 200')) return sock;
+    if (new TextDecoder().decode(value).includes(' 200')) return sock;
     sock.close();
-    throw new Error('Proxy Handshake Failed');
+    throw new Error('Proxy Fail');
 }
 
-// 转发逻辑：整合了“重试触发器”
-async function pipeRemoteToWebSocket(remoteSocket, ws, vlessHeader, onNoDataFallback) {
-    const reader = remoteSocket.readable.getReader();
+async function pipeRemoteToWebSocket(socket, ws, header, onTimeout) {
+    const reader = socket.readable.getReader();
     let headerSent = false;
-    let dataReceived = false;
+    socket.dataReceived = false;
+
+    // 缩短超时到 800ms，针对 CF 站点反应极快
+    const timer = setTimeout(() => {
+        if (!socket.dataReceived && onTimeout) reader.cancel();
+    }, 800);
 
     try {
-        // 设置一个简易的超时监测，如果 1.5 秒没收到数据且需要 fallback
-        const timeout = setTimeout(() => {
-            if (!dataReceived && onNoDataFallback) {
-                reader.cancel(); // 终止当前读取，触发外层的 fallback
-            }
-        }, 1500);
-
         while (true) {
             const { done, value } = await reader.read();
             if (done || ws.readyState !== 1) break;
 
-            dataReceived = true;
-            clearTimeout(timeout);
+            socket.dataReceived = true;
+            clearTimeout(timer);
 
             if (!headerSent) {
-                const combined = new Uint8Array(vlessHeader.byteLength + value.byteLength);
-                combined.set(vlessHeader, 0);
-                combined.set(value, vlessHeader.byteLength);
+                const combined = new Uint8Array(header.byteLength + value.byteLength);
+                combined.set(header, 0);
+                combined.set(value, header.byteLength);
                 ws.send(combined);
                 headerSent = true;
             } else {
@@ -155,44 +139,14 @@ async function pipeRemoteToWebSocket(remoteSocket, ws, vlessHeader, onNoDataFall
             }
         }
     } catch (e) {
-        if (!dataReceived && onNoDataFallback) {
-            await onNoDataFallback();
-        }
+        if (!socket.dataReceived && onTimeout) await onTimeout();
     } finally {
         reader.releaseLock();
     }
 }
 
-// --- 其余 VLESS 解析和 DNS 逻辑保持不变 ---
+// --- 其余工具函数 (parseVLESSHeader, createWebSocketReadableStream, handleUDPOutBound) 与上个回复一致 ---
 import { connect } from 'cloudflare:sockets';
-
-async function handleUDPOutBound(webSocket, vlessHeader) {
-    let headerSent = false;
-    const transformStream = new TransformStream({
-        transform(chunk, controller) {
-            for (let i = 0; i < chunk.byteLength;) {
-                const len = new DataView(chunk.slice(i, i + 2).buffer).getUint16(0);
-                controller.enqueue(chunk.slice(i + 2, i + 2 + len));
-                i += 2 + len;
-            }
-        }
-    });
-    transformStream.readable.pipeTo(new WritableStream({
-        async write(chunk) {
-            const resp = await fetch('https://1.1.1.1/dns-query', {
-                method: 'POST', headers: { 'content-type': 'application/dns-message' }, body: chunk,
-            });
-            const dnsResult = await resp.arrayBuffer();
-            const udpLen = new Uint8Array([(dnsResult.byteLength >> 8) & 0xff, dnsResult.byteLength & 0xff]);
-            if (webSocket.readyState === 1) {
-                const out = headerSent ? [udpLen, dnsResult] : [vlessHeader, udpLen, dnsResult];
-                webSocket.send(await new Blob(out).arrayBuffer());
-                headerSent = true;
-            }
-        }
-    }));
-    return { write(chunk) { transformStream.writable.getWriter().write(chunk); } };
-}
 
 function createWebSocketReadableStream(ws, earlyDataHeader) {
     return new ReadableStream({
@@ -225,4 +179,32 @@ function parseVLESSHeader(buffer) {
     if (type === 1) { address = Array.from(new Uint8Array(buffer.slice(offset, offset + 4))).join('.'); offset += 4; }
     else if (type === 2) { const len = view.getUint8(offset++); address = new TextDecoder().decode(buffer.slice(offset, offset + len)); offset += len; }
     return { hasError: false, addressRemote: address, portRemote: port, rawDataIndex: offset, vlessVersion: new Uint8Array([view.getUint8(0)]), isUDP: cmd === 2 };
+}
+
+async function handleUDPOutBound(webSocket, vlessHeader) {
+    let headerSent = false;
+    const transformStream = new TransformStream({
+        transform(chunk, controller) {
+            for (let i = 0; i < chunk.byteLength;) {
+                const len = new DataView(chunk.slice(i, i + 2).buffer).getUint16(0);
+                controller.enqueue(chunk.slice(i + 2, i + 2 + len));
+                i += 2 + len;
+            }
+        }
+    });
+    transformStream.readable.pipeTo(new WritableStream({
+        async write(chunk) {
+            const resp = await fetch('https://1.1.1.1/dns-query', {
+                method: 'POST', headers: { 'content-type': 'application/dns-message' }, body: chunk,
+            });
+            const dnsResult = await resp.arrayBuffer();
+            const udpLen = new Uint8Array([(dnsResult.byteLength >> 8) & 0xff, dnsResult.byteLength & 0xff]);
+            if (webSocket.readyState === 1) {
+                const out = headerSent ? [udpLen, dnsResult] : [vlessHeader, udpLen, dnsResult];
+                webSocket.send(await new Blob(out).arrayBuffer());
+                headerSent = true;
+            }
+        }
+    }));
+    return { write(chunk) { transformStream.writable.getWriter().write(chunk); } };
 }
