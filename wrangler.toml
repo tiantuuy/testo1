@@ -1,6 +1,6 @@
 name = "testo2"
 main = "_worker.js"
-compatibility_date = "2025-03-17"
+compatibility_date = "2025-03-27"
 workers_dev = true
 # wrangler.toml (wrangler v3.88.0^)
 [observability.logs]
