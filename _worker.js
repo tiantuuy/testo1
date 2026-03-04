@@ -27,7 +27,7 @@ const API_ERROR_RESPONSE = (url, status = 404) => {
 };
 
 
-let 反代IP = '', 启用ssty反代 = null, 启用ssty全局反代 = false, 我的ssty账号 = '', parsedSocks5Address = {};
+let 反代IP = 'yx1.9898981.xyz:8443', 启用ssty反代 = null, 启用ssty全局反代 = false, 我的ssty账号 = '', parsedSocks5Address = {};
 
 export default {
     async fetch(request) {
